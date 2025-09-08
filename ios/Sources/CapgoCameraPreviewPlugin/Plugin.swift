@@ -8,26 +8,22 @@ import MobileCoreServices
 
 extension UIWindow {
     static var isLandscape: Bool {
-        if #available(iOS 13.0, *) {
-            return UIApplication.shared.windows
-                .first?
-                .windowScene?
-                .interfaceOrientation
-                .isLandscape ?? false
-        } else {
-            return UIApplication.shared.statusBarOrientation.isLandscape
-        }
+        // iOS 14+ only: derive from the active window scene's interface orientation
+        let scene = UIApplication.shared
+            .connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+
+        return scene?.interfaceOrientation.isLandscape ?? false
     }
     static var isPortrait: Bool {
-        if #available(iOS 13.0, *) {
-            return UIApplication.shared.windows
-                .first?
-                .windowScene?
-                .interfaceOrientation
-                .isPortrait ?? false
-        } else {
-            return UIApplication.shared.statusBarOrientation.isPortrait
-        }
+        // iOS 14+ only: derive from the active window scene's interface orientation
+        let scene = UIApplication.shared
+            .connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+
+        return scene?.interfaceOrientation.isPortrait ?? false
     }
 }
 
@@ -142,6 +138,8 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
         guard let webView = self.webView else { return }
 
         DispatchQueue.main.async {
+            _ = CFAbsoluteTimeGetCurrent()
+
             // Define a recursive function to traverse the view hierarchy
             func makeSubviewsTransparent(_ view: UIView) {
                 // Set the background color to clear
@@ -156,7 +154,6 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
             // Set the main webView to be transparent
             webView.isOpaque = false
             webView.backgroundColor = .clear
-
             // Recursively make all subviews transparent
             makeSubviewsTransparent(webView)
 
@@ -224,15 +221,11 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
             let displayMultiplier = self.cameraController.getDisplayZoomMultiplier()
             var teleStep: Float
 
-            if #available(iOS 13.0, *) {
-                let switchFactors = device.virtualDeviceSwitchOverVideoZoomFactors
-                if !switchFactors.isEmpty {
-                    // Choose the highest switch-over factor (typically the wide->tele threshold)
-                    let maxSwitch = switchFactors.map { $0.floatValue }.max() ?? Float(device.maxAvailableVideoZoomFactor)
-                    teleStep = maxSwitch * displayMultiplier
-                } else {
-                    teleStep = Float(device.maxAvailableVideoZoomFactor) * displayMultiplier
-                }
+            let switchFactors = device.virtualDeviceSwitchOverVideoZoomFactors
+            if !switchFactors.isEmpty {
+                // Choose the highest switch-over factor (typically the wide->tele threshold)
+                let maxSwitch = switchFactors.map { $0.floatValue }.max() ?? Float(device.maxAvailableVideoZoomFactor)
+                teleStep = maxSwitch * displayMultiplier
             } else {
                 teleStep = Float(device.maxAvailableVideoZoomFactor) * displayMultiplier
             }
@@ -267,15 +260,9 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
     }
 
     @objc func rotated() {
-        guard let previewView = self.previewView,
-              let posX = self.posX,
-              let posY = self.posY,
-              let width = self.width,
-              let heightValue = self.height else {
+        guard let previewView = self.previewView else {
             return
         }
-        let paddingBottom = self.paddingBottom ?? 0
-        let height = heightValue - paddingBottom
 
         // Handle auto-centering during rotation
         // Always use the factorized method for consistent positioning
@@ -503,7 +490,6 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
     }
 
     @objc func start(_ call: CAPPluginCall) {
-        let startTime = CFAbsoluteTimeGetCurrent()
         print("[CameraPreview] 🚀 START CALLED at \(Date())")
 
         // Log all received settings
@@ -629,21 +615,24 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
         // Create and configure the preview view first
         self.updateCameraFrame()
 
-        // Make webview transparent - comprehensive approach
-        self.makeWebViewTransparent()
-
-        // Add the preview view to the webview itself to use same coordinate system
+        // Add preview view to hierarchy first
         self.webView?.addSubview(self.previewView)
         if self.toBack! {
             self.webView?.sendSubviewToBack(self.previewView)
         }
 
-        // Display the camera preview on the configured view
+        // Make webview transparent
+        self.makeWebViewTransparent()
+
+        // Don't block on orientation update - it's already set during layer creation
+        // Just update asynchronously if needed for future rotations
+        DispatchQueue.main.async { [weak self] in
+            self?.cameraController.updateVideoOrientation()
+        }
+
+        // Configure preview layer - it's already hidden from CameraController
         try? self.cameraController.displayPreview(on: self.previewView)
-
-        // Ensure the preview orientation matches the current interface orientation at startup
-        self.cameraController.updateVideoOrientation()
-
+        // Setup gestures
         self.cameraController.setupGestures(target: self.previewView, enableZoom: self.enableZoom!)
 
         // Add grid overlay if enabled
@@ -651,11 +640,10 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
             self.cameraController.addGridOverlay(to: self.previewView, gridMode: self.gridMode)
         }
 
+        // Setup observers for device rotation and app state changes
         if self.rotateWhenOrientationChanged == true {
             NotificationCenter.default.addObserver(self, selector: #selector(CameraPreview.rotated), name: UIDevice.orientationDidChangeNotification, object: nil)
         }
-
-        // Add observers for app state changes to maintain transparency
         NotificationCenter.default.addObserver(self, selector: #selector(CameraPreview.appDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(CameraPreview.appWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
 
@@ -706,7 +694,7 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
                 // Update preview layer frame without animation
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
-                
+
                 // Preserve aspect ratio if it was set
                 if let aspectRatio = self.cameraController.requestedAspectRatio,
                    let previewLayer = self.cameraController.previewLayer {
@@ -714,7 +702,7 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
                     let frame = self.cameraController.calculateAspectRatioFrame(for: aspectRatio, in: self.previewView.bounds)
                     previewLayer.frame = frame
                     previewLayer.videoGravity = .resizeAspectFill
-                    
+
                     // Keep grid overlay in sync with preview if it exists
                     self.cameraController.gridOverlayView?.frame = frame
                 } else {
@@ -722,7 +710,7 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
                     self.cameraController.previewLayer?.frame = self.previewView.bounds
                     self.cameraController.previewLayer?.videoGravity = .resizeAspectFill
                 }
-                
+
                 CATransaction.commit()
 
                 self.previewView.isUserInteractionEnabled = true
@@ -784,7 +772,7 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
     }
 
     @objc func capture(_ call: CAPPluginCall) {
-        print("[CameraPreview] capture called with options: \(call.options)")
+        print("[CameraPreview] capture called with options: \(call.options ?? [:])")
         let withExifLocation = call.getBool("withExifLocation", false)
         print("[CameraPreview] capture called, withExifLocation: \(withExifLocation)")
 
@@ -855,7 +843,7 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
 
     private func performCapture(call: CAPPluginCall) {
         print("[CameraPreview] performCapture called")
-        print("[CameraPreview] Call parameters: \(call.options)")
+        print("[CameraPreview] Call parameters: \(call.options ?? [:])")
         let quality = call.getFloat("quality", 85)
         let saveToGallery = call.getBool("saveToGallery", false)
         let withExifLocation = call.getBool("withExifLocation", false)
@@ -1014,8 +1002,13 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
                     notchInset = safeAreaInsets.top
                 }
             } else {
-                // Fallback: use status bar height as approximation
-                notchInset = UIApplication.shared.statusBarFrame.height
+                // Fallback for iOS 14+: try to derive from any available window's safe area
+                let anyWindow = UIApplication.shared
+                    .connectedScenes
+                    .compactMap { $0 as? UIWindowScene }
+                    .flatMap { $0.windows }
+                    .first
+                notchInset = anyWindow?.safeAreaInsets.top ?? 0
             }
 
             let result: [String: Any] = [
@@ -1679,7 +1672,7 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
     }
 
     private func updateCameraFrame() {
-        guard let width = self.width, let height = self.height, let posX = self.posX, let posY = self.posY else {
+        guard let posX = self.posX, let posY = self.posY else {
             return
         }
 
@@ -1935,7 +1928,14 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
         }
     }
 
+    private var lastOrientation: String?
+
     @objc private func handleOrientationChange() {
+        let currentOrientation = self.currentOrientationString()
+        if currentOrientation == "portrait-upside-down" || currentOrientation == lastOrientation {
+            return
+        }
+        lastOrientation = currentOrientation
         DispatchQueue.main.async {
             let result = self.rawSetAspectRatio()
             self.notifyListeners("screenResize", data: result)
